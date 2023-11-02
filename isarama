@@ -1,0 +1,207 @@
+package isarama
+
+import (
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+  "ilog"
+	"github.com/Shopify/sarama"
+)
+
+type AsyncProducer struct {
+	producer sarama.AsyncProducer
+}
+
+type KafkaClient struct {
+	client             sarama.Client
+	consumer           sarama.Consumer
+	consumerGroup      sarama.ConsumerGroup
+	partitionConsumers map[string]map[int32]sarama.PartitionConsumer
+	stop               map[string]map[int32]chan struct{}
+	topicHandler       map[string]func(message sarama.ConsumerMessage)
+}
+
+func (kc *KafkaClient) GetPartitionConsumers() map[string]map[int32]sarama.PartitionConsumer {
+	return kc.partitionConsumers
+}
+func NewKafkaClient(addr []string, cfg *sarama.Config) (*KafkaClient, error) {
+	c, err := sarama.NewClient(addr, cfg)
+	if err != nil {
+		return nil, err
+	}
+	cm, err := sarama.NewConsumerFromClient(c)
+	if err != nil {
+		return nil, err
+	}
+
+	return &KafkaClient{
+		client:             c,
+		consumer:           cm,
+		consumerGroup:      nil,
+		partitionConsumers: map[string]map[int32]sarama.PartitionConsumer{},
+		topicHandler:       map[string]func(message sarama.ConsumerMessage){},
+	}, nil
+}
+
+// Close shutdown前需调用
+func (kc *KafkaClient) Close() {
+	for topic, _ := range kc.partitionConsumers {
+		kc.StopConsumeTopic(topic)
+	}
+	kc.consumer.Close()
+	kc.client.Close()
+}
+
+func (kc *KafkaClient) RegisterTopicHandler(topic string, handler func(message sarama.ConsumerMessage)) {
+	kc.topicHandler[topic] = handler
+}
+
+func (kc *KafkaClient) GetOffset(topic string, partition int32, time int64) (int64, error) {
+	offset, err := kc.client.GetOffset(topic, partition, time)
+	if err != nil {
+		return sarama.OffsetNewest, err
+	}
+	return offset, nil
+}
+
+func (kc *KafkaClient) NewTopicConsumers(topics []string, time int64) error {
+	tp := make(map[string]map[int32]sarama.PartitionConsumer)
+	stop := make(map[string]map[int32]chan struct{})
+	for _, topic := range topics {
+		tp[topic] = make(map[int32]sarama.PartitionConsumer)
+		stop[topic] = make(map[int32]chan struct{})
+	}
+	errs := make([]error, 0)
+	for _, topic := range topics {
+		partitions, err := kc.client.Partitions(topic)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+
+		for _, partition := range partitions {
+			offset, err := kc.GetOffset(topic, partition, time)
+			if err != nil {
+				ilog.Log.Errorf("get offset err: %v", err)
+				continue
+			}
+			cp, err := kc.NewPartitionConsumer(topic, partition, offset)
+			if err != nil {
+				ilog.Log.Errorf("new partition consumer err: %v", err)
+				continue
+			}
+			tp[topic][partition] = cp
+		}
+	}
+	kc.partitionConsumers = tp
+	if len(errs) != 0 {
+		return fmt.Errorf("something wrong")
+	}
+	return nil
+}
+
+func (kc *KafkaClient) NewPartitionConsumer(topic string, partition int32, offset int64) (sarama.PartitionConsumer, error) {
+	cp, err := kc.consumer.ConsumePartition(topic, partition, offset)
+	if err != nil {
+		return nil, err
+	}
+	if kc.partitionConsumers[topic] == nil {
+		kc.partitionConsumers[topic] = make(map[int32]sarama.PartitionConsumer)
+	}
+	kc.partitionConsumers[topic][partition] = cp
+	return cp, nil
+}
+
+func (kc *KafkaClient) StopConsumeTopic(topic string) error {
+	partitions, ok := kc.partitionConsumers[topic]
+	if !ok {
+		return fmt.Errorf("topic not found")
+	}
+	for partition, _ := range partitions {
+		kc.partitionConsumers[topic][partition].Close()
+	}
+	return nil
+}
+
+// ConsumeTopic 注意！！！ 此函数是一个阻塞式函数，会一直运行
+func (kc *KafkaClient) ConsumeTopic(topic string) error {
+	partitions, ok := kc.partitionConsumers[topic]
+	if !ok {
+		return fmt.Errorf("topic not found:%v", topic)
+	}
+	wg := sync.WaitGroup{}
+	for partition, _ := range partitions {
+		wg.Add(1)
+		go func(innerT string, innerP int32) {
+			defer wg.Done()
+			kc.ConsumePartition(innerT, innerP)
+		}(topic, partition)
+	}
+	wg.Wait()
+	return nil
+}
+
+func (kc *KafkaClient) StopConsumePartition(topic string, partition int32) {
+	if _, ok := kc.partitionConsumers[topic]; ok {
+		if _, ok2 := kc.partitionConsumers[topic][partition]; ok2 {
+			kc.partitionConsumers[topic][partition].Close()
+		}
+	}
+}
+
+func (kc *KafkaClient) ConsumePartition(topic string, partition int32) error {
+	if v, ok := kc.partitionConsumers[topic]; ok {
+		if pc, ok := v[partition]; ok {
+			ticker := time.NewTicker(time.Second * 1800)
+			defer ticker.Stop()
+			for {
+				select {
+				case message := <-pc.Messages():
+					kc.consumeMessage(message)
+				case err := <-pc.Errors(): // 侦听stop信号
+					ilog.Log.Warnf("consume stopped, topic: %v, err: %v", topic, err)
+					return err
+				case <-ticker.C:
+					hwm, _ := kc.GetOffset(topic, partition, sarama.OffsetNewest)
+					curr, _ := kc.GetOffset(topic, partition, time.Now().Unix()*1000)
+					if curr == sarama.OffsetNewest { //
+						curr = hwm
+					}
+					ilog.Log.Infof("increment_info consume info,topic: %v, partition: %v, hwm: %v, curr: %v, hwm-curr: %v ", topic, partition, hwm, curr, hwm-curr)
+					altertVal := 1000
+					if hwm-curr > int64(altertVal) {
+						ilog.Log.Alertf("增量消息积压数：%v", hwm-curr)
+					}
+				}
+			}
+		}
+	}
+
+	return errors.New("topic, partition invalid")
+}
+
+var ms map[int32][]int64
+var lock sync.Mutex
+
+func init() {
+	ms = make(map[int32][]int64)
+	lock = sync.Mutex{}
+}
+
+func (kc *KafkaClient) consumeMessage(msg *sarama.ConsumerMessage) {
+	if msg == nil { //结束消费时，会读到nil值
+		return
+	}
+	handler, ok := kc.topicHandler[msg.Topic]
+	if !ok {
+		ilog.Log.Errorf("topic handler not found,topic:%v", handler)
+		defaultHandler(*msg)
+		return
+	}
+	handler(*msg) // 执行用户注册的handler
+}
+
+func defaultHandler(msg sarama.ConsumerMessage) {
+	ilog.Log.Warnf("unhandled message, topic: %v ,partition: %v, key: %v  \n", msg.Topic, msg.Partition, string(msg.Key))
+}
